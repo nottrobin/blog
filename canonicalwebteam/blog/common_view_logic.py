@@ -1,95 +1,89 @@
-from datetime import datetime
+# Standard library
+import html
+import re
+from datetime import datetime, date
 
+# Packages
+import json
+import requests
+from werkzeug.contrib.atom import AtomFeed
+
+# Local
 from canonicalwebteam.blog import logic
 from canonicalwebteam.blog import wordpress_api as api
+from canonicalwebteam.blog.http import fetch_all
+from canonicalwebteam.blog.wordpress import UrlBuilder, Parser
 from dateutil.relativedelta import relativedelta
 
-from werkzeug.contrib.atom import AtomFeed
+
+EVENTS = 1175
+WEBINARS = 1187
+TIMEOUT = 5
+CLEAN_HTML_REGEX = re.compile("<.*?>")
 
 
 class BlogViews:
-    def __init__(self, tag_ids, excluded_tags, blog_title, tag_name):
-        self.tag_ids = tag_ids
-        self.excluded_tags = excluded_tags
-        self.blog_title = blog_title
-        self.tag_name = tag_name
+    def __init__(self, tag_ids, tags_exclude):
+        self.urls = UrlBuilder(tags=tag_ids, tags_exclude=tags_exclude)
+        self.parse = Parser(tags=tag_ids, tags_exclude=tags_exclude)
 
-    def get_index(self, page=1, category="", enable_upcoming=True):
-        categories = []
-        if category:
-            category_resolved = api.get_category_by_slug(category)
-            if category_resolved:
-                categories.append(category_resolved.get("id", ""))
-
-        upcoming = []
-        featured_articles = []
-        if page == 1:
-            featured_articles, _ = api.get_articles(
-                tags=self.tag_ids,
-                tags_exclude=self.excluded_tags,
+    def get_index(self, page=1, category_ids=None):
+        # Queue up request for the first 12 posts
+        urls = [
+            self.urls.posts(
                 page=page,
-                sticky="true",
-                per_page=3,
+                per_page=12,
+                categories=category_ids,
+                sticky=False,
+                _embed=True,
+            )
+        ]
+
+        # For the first page, also get featured and upcoming posts
+        if page == 1:
+            urls.append(self.urls.posts(per_page=3, sticky=True, _embed=True))
+            urls.append(
+                self.urls.posts(
+                    per_page=3, categories=[EVENTS, WEBINARS], _embed=True
+                )
             )
 
-            if enable_upcoming:
-                # Maybe we can get the IDs since there is no chance
-                # this going to move
-                events = api.get_category_by_slug("events")
-                webinars = api.get_category_by_slug("webinars")
-                upcoming, _ = api.get_articles(
-                    tags=self.tag_ids,
-                    tags_exclude=self.excluded_tags,
-                    page=page,
-                    per_page=3,
-                    categories=[events["id"], webinars["id"]],
-                )
+        # Fetch all URLs, concurrently
+        results = fetch_all(urls, timeout=TIMEOUT)
 
-        articles, metadata = api.get_articles(
-            tags=self.tag_ids,
-            tags_exclude=self.excluded_tags,
-            exclude=[article["id"] for article in featured_articles],
-            page=page,
-            categories=categories,
-        )
-        total_pages = metadata["total_pages"]
+        # Get posts from results
+        posts_response = results[0]["response"]
+        posts = json.loads(results[0]["text"])
 
-        context = get_index_context(
-            page,
-            articles,
-            total_pages,
-            featured_articles=featured_articles,
-            upcoming=upcoming,
-        )
+        # Get featured and upcoming posts from results
+        if len(results) > 1:
+            featured_posts = json.loads(results[1]["text"])
+            upcoming_posts = json.loads(results[2]["text"])
+        else:
+            featured_posts = None
+            upcoming_posts = None
 
-        context["title"] = self.blog_title
-        context["category"] = {"slug": category}
-        context["upcoming"] = upcoming
-
-        return context
+        # Send everything to the template
+        return {
+            "current_page": page,
+            "total_pages": posts_response.headers.get("x-wp-totalpages"),
+            "posts": self.parse.posts(posts),
+            "featured_posts": self.parse.posts(featured_posts),
+            "upcoming_posts": self.parse.posts(upcoming_posts),
+        }
 
     def get_article(self, slug):
-        article = api.get_article(slug, self.tag_ids, self.excluded_tags)
+        post
 
-        if not article:
-            return {}
+        post_info = format_post_info(post)
+        post_info['content'] = replace_images_with_cloudinary(post["content"]["rendered"])
 
-        return get_article_context(article, self.tag_ids, self.excluded_tags)
+        return post_info
 
-    def get_latest_article(self):
-        articles, _ = api.get_articles(
-            tags=self.tag_ids,
-            tags_exclude=self.excluded_tags,
-            page=1,
-            per_page=1,
-        )
+    def get_latest_id(self):
+        response = requests.get(self.urls.posts(per_page=1), timeout=TIMEOUT)
 
-        if not articles:
-            return {}
-
-        return get_article_context(
-            articles[0], self.tag_ids, self.excluded_tags
-        )
+        return response.json()[0]["slug"]
 
     def get_group(self, group_slug, page=1, category_slug=""):
         group = api.get_group_by_slug(group_slug)
@@ -288,65 +282,103 @@ class BlogViews:
         return context
 
 
-def get_complete_article(article, group=None):
+def format_excerpt(post):
+    # Remove any HTML
+    clean_text = re.sub(CLEAN_HTML_REGEX, "", post["excerpt"]["raw"])
+    raw_content = html.unescape(clean_text).replace("\n", "")[:340]
+
+    # If the excerpt doesn't end before 340 characters, add ellipsis
+    # ===
+
+    # split at the last 3 characters
+    raw_content_start = raw_content[:-3]
+    raw_content_end = raw_content[-3:]
+
+    # for the last 3 characters replace any part of […]
+    raw_content_end = raw_content_end.replace("[", "")
+    raw_content_end = raw_content_end.replace("…", "")
+    raw_content_end = raw_content_end.replace("]", "")
+
+    # join it back up
+    return "".join([raw_content_start, raw_content_end, " […]"])
+
+
+def format_post_info(post):
     """
-    This returns any given article from the wordpress API
-    as an object that includes all information for the templates,
-    some of which will be fetched from the Wordpress API
-    """
-    featured_images = logic.get_embedded_featured_media(article["_embedded"])
-    featured_image = {}
-    if featured_images:
-        featured_image = featured_images[0]
-    author = logic.get_embedded_author(article["_embedded"])
-    categories = logic.get_embedded_categories(article["_embedded"])
-
-    for category in categories:
-        if "display_category" not in article:
-            article["display_category"] = category
-
-    if group:
-        article["group"] = group
-    else:
-        article["group"] = logic.get_embedded_group(article["_embedded"])
-
-    return logic.transform_article(
-        article, featured_image=featured_image, author=author
-    )
-
-
-def get_index_context(
-    page_param, articles, total_pages, featured_articles=[], upcoming=[]
-):
-    """
-    Build the content for the index page
-    :param page_param: String or int for index of the page to get
-    :param articles: Array of articles
-    :param articles: String of int of total amount of pages
-    :param featured_articles: List of featured articles
-    :param upcoming_articles: List of upcoming articles
+    Parse out the most common useful info from a wordpres post response
     """
 
-    transformed_articles = []
-    transformed_featured_articles = []
-    transformed_upcoming_articles = []
+    images = post["_embedded"].get("wp:featuredmedia", [])
+    start_date = None
+    end_date = None
 
-    for article in articles:
-        transformed_articles.append(get_complete_article(article))
+    if (
+        post.get("_start_month")
+        and post.get("_start_year")
+        and post.get("_start_day")
+    ):
+        post["start_date"] = "{} {} {}".format(
+            post["_start_day"],
+            date(1900, int(post["_start_month"]), 1).strftime("%B"),
+            post["_start_year"],
+        )
 
-    for article in featured_articles:
-        transformed_featured_articles.append(get_complete_article(article))
-
-    for article in upcoming:
-        transformed_upcoming_articles.append(get_complete_article(article))
+    if (
+        post.get("_end_month")
+        and post.get("_end_year")
+        and post.get("_end_day")
+    ):
+        post["end_date"] = "{} {} {}".format(
+            post["_end_day"],
+            date(1900, int(post["_end_month"]), 1).strftime("%B"),
+            post["_end_year"],
+        )
 
     return {
-        "current_page": int(page_param),
-        "total_pages": int(total_pages),
-        "articles": transformed_articles,
-        "featured_articles": transformed_featured_articles,
-        "upcoming": transformed_upcoming_articles,
+        "image": images[0] if images else None,
+        "start_date": start_date,
+        "end_date": end_date,
+        "author": post["_embedded"].get("author", [{}])[0],
+        "category": post["_embedded"]["wp:term"][0][0],
+        "group": post["_embedded"]["wp:term"][3][0],
+        "date": datetime.strptime(
+            post["date_gmt"], "%Y-%m-%dT%H:%M:%S"
+        ).strftime("%-d %B %Y"),
     }
+
+
+def replace_images_with_cloudinary(content):
+    """
+    Prefixes images with cloudinary optimised URLs and adds srcset for
+    image scaling
+
+    :param content: The HTML string to convert
+
+    :returns: Update HTML string with converted images
+    """
+    cloudinary = "https://res.cloudinary.com/"
+
+    urls = [
+        cloudinary + r"canonical/image/fetch/q_auto,f_auto,w_350/\g<url>",
+        cloudinary + r"canonical/image/fetch/q_auto,f_auto,w_650/\g<url>",
+        cloudinary + r"canonical/image/fetch/q_auto,f_auto,w_1300/\g<url>",
+        cloudinary + r"canonical/image/fetch/q_auto,f_auto,w_1950/\g<url>",
+    ]
+
+    image_match = (
+        r'<img(?P<prefix>[^>]*) src="(?P<url>[^"]+)"(?P<suffix>[^>]*)>'
+    )
+    replacement = (
+        r"<img\g<prefix>"
+        f' decoding="async"'
+        f' src="{urls[1]}"'
+        f' srcset="{urls[0]} 350w, {urls[1]} 650w, {urls[2]} 1300w,'
+        f' {urls[3]} 1950w"'
+        f' sizes="(max-width: 400px) 350w, 650px"'
+        r"\g<suffix>>"
+    )
+
+    return re.sub(image_match, replacement, content)
 
 
 def get_group_page_context(
@@ -359,6 +391,7 @@ def get_group_page_context(
     :param articles: String of int of total amount of pages
     :param group: Article group
     """
+
     context = get_index_context(
         page_param, articles, total_pages, featured_articles
     )
@@ -383,6 +416,7 @@ def get_article_context(article, related_tag_ids=[], excluded_tags=[]):
     Build the content for the article page
     :param article: Article to create context for
     """
+
     transformed_article = get_complete_article(article)
 
     tags = logic.get_embedded_tags(article["_embedded"])

@@ -2,3 +2,4 @@
 *.egg-info/
 dist/
 .webcache
+pip-wheel-metadata/

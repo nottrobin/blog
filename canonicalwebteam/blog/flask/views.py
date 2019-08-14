@@ -20,15 +20,13 @@ def build_blueprint(
     @blog.route("/")
     def homepage():
         page_param = flask.request.args.get("page", default=1, type=int)
-        category_param = flask.request.args.get(
-            "category", default="", type=str
+        category_id = flask.request.args.get(
+            "category_id", default="", type=str
         )
 
         try:
             context = blog_views.get_index(
-                page=page_param,
-                category=category_param,
-                enable_upcoming=enable_upcoming,
+                page=page_param, category_id=category_id
             )
         except Exception:
             return flask.abort(502)
@@ -72,10 +70,7 @@ def build_blueprint(
 
     @blog.route("/<slug>")
     def article(slug):
-        try:
-            context = blog_views.get_article(slug)
-        except Exception:
-            return flask.abort(502)
+        context = blog_views.get_article(slug)
 
         if not context:
             flask.abort(404, "Article not found")
